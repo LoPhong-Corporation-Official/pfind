@@ -13,6 +13,7 @@
 namespace pfind {
 
 enum class SortKey { None, Name, Size, Time };
+enum class ColorMode { Auto, Always, Never };
 
 struct OutputOptions {
     SortKey sort{SortKey::None};
@@ -22,6 +23,7 @@ struct OutputOptions {
     bool countOnly{false};
     bool quiet{false};      // no summary / warnings header
     bool verbose{false};    // print the effective search settings
+    ColorMode color{ColorMode::Auto};
 };
 
 struct CLIResult {

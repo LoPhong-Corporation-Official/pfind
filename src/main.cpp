@@ -6,14 +6,23 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <vector>
 
 #ifdef _WIN32
+#include <io.h>
 #include <windows.h>
 #include <shellapi.h>
+#define PFIND_ISATTY(fd) _isatty(fd)
+#define PFIND_FILENO(f) _fileno(f)
+#else
+#include <unistd.h>
+#define PFIND_ISATTY(fd) isatty(fd)
+#define PFIND_FILENO(f) fileno(f)
 #endif
 
 namespace {
@@ -42,14 +51,60 @@ std::vector<std::string> getUtf8Arguments() {
 }
 #endif
 
-std::string describe(const pfind::FileInfo& file, bool details) {
-    std::string line = pfind::utf8::fromPath(file.path);
+// ANSI escape sequences; all empty when colour is off.
+struct Palette {
+    const char* path = "";
+    const char* directory = "";
+    const char* lineNumber = "";
+    const char* separator = "";
+    const char* dim = "";
+    const char* reset = "";
+};
+
+bool shouldUseColor(pfind::ColorMode mode) {
+    if (mode == pfind::ColorMode::Never) {
+        return false;
+    }
+    if (mode == pfind::ColorMode::Always) {
+        return true;
+    }
+
+    const char* noColor = std::getenv("NO_COLOR");
+    if (noColor != nullptr && noColor[0] != '\0') {
+        return false;
+    }
+    const char* term = std::getenv("TERM");
+    if (term != nullptr && std::string(term) == "dumb") {
+        return false;
+    }
+    return PFIND_ISATTY(PFIND_FILENO(stdout)) != 0;
+}
+
+Palette makePalette(bool enabled) {
+    Palette palette;
+    if (enabled) {
+        palette.path = "\x1b[35m";        // magenta
+        palette.directory = "\x1b[1;34m"; // bold blue
+        palette.lineNumber = "\x1b[32m";  // green
+        palette.separator = "\x1b[36m";   // cyan
+        palette.dim = "\x1b[2m";
+        palette.reset = "\x1b[0m";
+    }
+    return palette;
+}
+
+std::string describe(const pfind::FileInfo& file, bool details, const Palette& colors) {
+    std::string line = file.isDirectory ? colors.directory : colors.path;
+    line += pfind::utf8::fromPath(file.path);
+    line += colors.reset;
 
     if (details) {
+        line += colors.dim;
         line += "  [";
         line += file.isDirectory ? "<dir>" : pfind::formatSize(file.size);
         line += "]  ";
         line += pfind::formatLocalTime(file.lastWriteTime);
+        line += colors.reset;
     }
 
     return line;
@@ -60,7 +115,18 @@ std::string toJson(const pfind::FileInfo& file) {
     json += ",\"type\":\"";
     json += file.isDirectory ? "dir" : "file";
     json += "\",\"size\":" + std::to_string(file.size);
-    json += ",\"modified\":\"" + pfind::formatIsoUtc(file.lastWriteTime) + "\"}";
+    json += ",\"modified\":\"" + pfind::formatIsoUtc(file.lastWriteTime) + "\"";
+    if (!file.matches.empty()) {
+        json += ",\"matches\":[";
+        for (std::size_t i = 0; i < file.matches.size(); ++i) {
+            if (i > 0) json += ',';
+            json += "{\"line\":" + std::to_string(file.matches[i].line) +
+                    ",\"text\":\"" + pfind::jsonEscape(file.matches[i].text) + "\"" +
+                    (file.matches[i].context ? ",\"context\":true" : "") + "}";
+        }
+        json += ']';
+    }
+    json += '}';
     return json;
 }
 
@@ -136,6 +202,7 @@ int main(int argc, char* argv[]) {
         std::cerr << "Searching: " << pfind::utf8::fromPath(options.root) << '\n';
         for (const auto& p : options.patterns) std::cerr << "Pattern:   " << p << '\n';
         for (const auto& x : options.excludes) std::cerr << "Exclude:   " << x << '\n';
+        if (options.contentPattern) std::cerr << "Contains:  " << *options.contentPattern << '\n';
         std::cerr << "----------------------------------------\n";
     }
 
@@ -143,6 +210,22 @@ int main(int argc, char* argv[]) {
     const bool collect = output.sort != pfind::SortKey::None;
     std::vector<pfind::FileInfo> collected;
 
+    bool printedGroup = false;
+
+    const bool plainOutput = !output.json && !output.null && !output.countOnly;
+    bool useColor = plainOutput && shouldUseColor(output.color);
+#ifdef _WIN32
+    if (useColor) {
+        // Enable ANSI sequences on the Windows console (Windows 10+).
+        HANDLE handle = GetStdHandle(STD_OUTPUT_HANDLE);
+        DWORD mode = 0;
+        if (handle == INVALID_HANDLE_VALUE || !GetConsoleMode(handle, &mode) ||
+            !SetConsoleMode(handle, mode | 0x0004 /* ENABLE_VIRTUAL_TERMINAL_PROCESSING */)) {
+            useColor = output.color == pfind::ColorMode::Always;  // redirected output: honour "always"
+        }
+    }
+#endif
+    const Palette colors = makePalette(useColor);
     auto emit = [&](const pfind::FileInfo& file) {
         if (output.countOnly) {
             return;
@@ -151,8 +234,32 @@ int main(int argc, char* argv[]) {
             std::cout << toJson(file) << '\n';
         } else if (output.null) {
             std::cout << pfind::utf8::fromPath(file.path) << '\0';
+        } else if (!file.matches.empty() && !options.filesWithMatches) {
+            const std::string path = pfind::utf8::fromPath(file.path);
+            const bool withContext = options.beforeContext > 0 || options.afterContext > 0;
+
+            if (withContext && printedGroup) {
+                std::cout << colors.separator << "--" << colors.reset << '\n';  // separates files
+            }
+            printedGroup = true;
+
+            std::size_t previousLine = 0;
+            for (const auto& match : file.matches) {
+                if (withContext && previousLine != 0 && match.line != previousLine + 1) {
+                    std::cout << colors.separator << "--" << colors.reset << '\n';  // gap between groups
+                }
+                previousLine = match.line;
+
+                const char separator = match.context ? '-' : ':';
+                std::cout << colors.path << path << colors.reset
+                          << colors.separator << separator << colors.reset
+                          << colors.lineNumber << match.line << colors.reset
+                          << colors.separator << separator << colors.reset << ' '
+                          << (match.context ? colors.dim : "") << match.text
+                          << (match.context ? colors.reset : "") << '\n';
+            }
         } else {
-            std::cout << describe(file, options.showDetails) << '\n';
+            std::cout << describe(file, options.showDetails, colors) << '\n';
         }
     };
 
@@ -161,7 +268,14 @@ int main(int argc, char* argv[]) {
                               output.sort == pfind::SortKey::Size ||
                               output.sort == pfind::SortKey::Time;
 
-    pfind::SearchEngine engine(options);
+    std::optional<pfind::SearchEngine> engineStorage;
+    try {
+        engineStorage.emplace(options);
+    } catch (const std::exception& error) {
+        std::cerr << "Error: " << error.what() << '\n';
+        return 2;
+    }
+    pfind::SearchEngine& engine = *engineStorage;
     const auto start = std::chrono::steady_clock::now();
 
     const std::size_t count = engine.search([&](const pfind::FileInfo& file) {

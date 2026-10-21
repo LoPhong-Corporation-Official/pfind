@@ -106,6 +106,9 @@ CLIResult CLIParser::parse(const std::vector<std::string>& args) {
             if (is(name, "-i", "--case-insensitive")) { noValue(); options.caseSensitive = false; continue; }
             if (is(name, "-s", "--case-sensitive"))   { noValue(); options.caseSensitive = true;  continue; }
             if (name == "--ignore-accents")           { noValue(); options.ignoreAccents = true;  continue; }
+            if (is(name, "-r", "--regex"))            { noValue(); options.regex = true;          continue; }
+            if (is(name, "-E", "--grep-regex"))       { noValue(); options.contentRegex = true;   continue; }
+            if (is(name, "-l", "--files-with-matches")) { noValue(); options.filesWithMatches = true; continue; }
             if (name == "--full-path")                { noValue(); options.matchFullPath = true;  continue; }
             if (name == "--follow-symlinks")          { noValue(); options.followSymlinks = true; continue; }
             if (name == "--details")                  { noValue(); options.showDetails = true;    continue; }
@@ -125,6 +128,48 @@ CLIResult CLIParser::parse(const std::vector<std::string>& args) {
 
             if (is(name, "-x", "--exclude")) {
                 options.excludes.emplace_back(value());
+                continue;
+            }
+
+            if (is(name, "-g", "--grep")) {
+                const std::string_view v = value();
+                if (v.empty()) {
+                    fail("--grep needs a non-empty text.");
+                }
+                options.contentPattern = std::string(v);
+                continue;
+            }
+
+            if (is(name, "-A", "--after-context") || is(name, "-B", "--before-context") ||
+                is(name, "-C", "--context")) {
+                const std::string_view v = value();
+                const auto lines = parseUnsigned(v);
+                if (!lines || *lines > 1000) {
+                    fail("Invalid value for " + std::string(name) + ": '" + std::string(v) +
+                         "' (use 0 to 1000).");
+                }
+                if (name != "-B" && name != "--before-context") options.afterContext = *lines;
+                if (name != "-A" && name != "--after-context")  options.beforeContext = *lines;
+                continue;
+            }
+
+            if (is(name, "-j", "--jobs")) {
+                const std::string_view v = value();
+                const auto jobs = parseUnsigned(v);
+                if (!jobs || *jobs == 0 || *jobs > 256) {
+                    fail("Invalid value for --jobs: '" + std::string(v) + "' (use 1 to 256).");
+                }
+                options.jobs = static_cast<unsigned>(*jobs);
+                continue;
+            }
+
+            if (name == "--max-lines") {
+                const std::string_view v = value();
+                const auto limit = parseUnsigned(v);
+                if (!limit || *limit == 0) {
+                    fail("Invalid value for --max-lines: '" + std::string(v) + "' (use 1 or more).");
+                }
+                options.maxLinesPerFile = *limit;
                 continue;
             }
 
@@ -179,6 +224,15 @@ CLIResult CLIParser::parse(const std::vector<std::string>& args) {
                 continue;
             }
 
+            if (name == "--color") {
+                const std::string_view v = value();
+                if (v == "auto")        output.color = ColorMode::Auto;
+                else if (v == "always") output.color = ColorMode::Always;
+                else if (v == "never")  output.color = ColorMode::Never;
+                else fail("Invalid value for --color: '" + std::string(v) + "' (use auto, always or never).");
+                continue;
+            }
+
             if (name == "--sort") {
                 const std::string_view v = value();
                 if (v == "name")      output.sort = SortKey::Name;
@@ -197,6 +251,25 @@ CLIResult CLIParser::parse(const std::vector<std::string>& args) {
 
         if (options.minSize && options.maxSize && *options.minSize > *options.maxSize) {
             fail("--min-size must not be greater than --max-size.");
+        }
+
+        if (options.contentRegex && !options.contentPattern) {
+            fail("--grep-regex needs --grep.");
+        }
+        if (options.filesWithMatches && !options.contentPattern) {
+            fail("--files-with-matches needs --grep.");
+        }
+        if ((options.beforeContext > 0 || options.afterContext > 0) && !options.contentPattern) {
+            fail("-A/-B/-C need --grep.");
+        }
+        if (options.jobs && !options.contentPattern) {
+            fail("--jobs needs --grep.");
+        }
+        if (options.maxLinesPerFile && !options.contentPattern) {
+            fail("--max-lines needs --grep.");
+        }
+        if (options.contentPattern && options.type == EntryType::Directory) {
+            fail("--grep cannot be combined with --type dir.");
         }
 
         if (output.json && output.null) {
@@ -221,14 +294,28 @@ void CLIParser::printHelp(const char* programName) {
         << "  " << programName << " C:\\Projects '*.h' --details --sort size --reverse\n"
         << "  " << programName << " /home/user 'report*' --ignore-accents --modified-within 7d\n"
         << "  " << programName << " . '*.log' --min-size 10M -x node_modules -x .git\n"
-        << "  " << programName << " . '*.tmp' --print0 | xargs -0 rm\n\n"
+        << "  " << programName << " . '*.tmp' --print0 | xargs -0 rm\n"
+        << "  " << programName << " src '*.cpp' --grep TODO -C 2\n"
+        << "  " << programName << " . '*.log' -g 'error|fatal' -E -l\n"
+        << "  " << programName << " . -r '^test_.*\\.(cpp|hpp)$'\n\n"
         << "Matching:\n"
         << "  -p, --pattern <pattern>       Search pattern (repeatable; extra positional args work too)\n"
         << "  -x, --exclude <pattern>       Skip matching files and directories (repeatable)\n"
         << "  -i, --case-insensitive        Case-insensitive matching (default)\n"
         << "  -s, --case-sensitive          Case-sensitive matching\n"
         << "      --ignore-accents          'tai lieu' also matches 'Tài liệu'\n"
+        << "  -r, --regex                   File name patterns and --exclude are regular expressions (ECMAScript)\n"
         << "      --full-path               Match against the path relative to <path>, not the name\n\n"
+        << "Content search:\n"
+        << "  -g, --grep <text>             Only files containing the text (binary files are skipped);\n"
+        << "                                prints path:line: text for each matching line\n"
+        << "  -E, --grep-regex              Treat the --grep text as a regular expression\n"
+        << "  -l, --files-with-matches      With --grep, print only the file names\n"
+        << "      --max-lines <n>           With --grep, show at most n matching lines per file\n"
+        << "  -A, --after-context <n>       With --grep, also show n lines after each match\n"
+        << "  -B, --before-context <n>      With --grep, also show n lines before each match\n"
+        << "  -C, --context <n>             Both of the above\n"
+        << "  -j, --jobs <n>                Threads used to scan file contents (default: automatic)\n\n"
         << "Filtering:\n"
         << "      --type <file|dir|all>     Kind of entry to report (default: file)\n"
         << "      --all                     Same as --type all\n"
@@ -240,6 +327,8 @@ void CLIParser::printHelp(const char* programName) {
         << "      --follow-symlinks         Follow directory symbolic links (loops are detected)\n\n"
         << "Output:\n"
         << "      --details                 Show size and modification time\n"
+        << "      --color <auto|always|never>  Colour the output (default: auto = only on a terminal;\n"
+        << "                                NO_COLOR is respected)\n"
         << "      --sort <name|size|time>   Sort results (collects all matches first)\n"
         << "      --reverse                 Reverse the sort order\n"
         << "      --json                    One JSON object per line\n"

@@ -2,10 +2,71 @@
 
 #include "Utf8.hpp"
 
+#include <stdexcept>
+
 namespace pfind {
+namespace {
+
+bool isAscii(std::string_view text) {
+    unsigned char accumulated = 0;
+    for (const char c : text) {
+        accumulated |= static_cast<unsigned char>(c);
+    }
+    return accumulated < 0x80;
+}
+
+unsigned char lowerAscii(char c) {
+    const auto u = static_cast<unsigned char>(c);
+    return (u >= 'A' && u <= 'Z') ? static_cast<unsigned char>(u + 32) : u;
+}
+
+// `needle` is already lower-case when !caseSensitive.
+bool asciiContains(std::string_view text, const std::string& needle, bool caseSensitive) {
+    if (needle.size() > text.size()) {
+        return false;
+    }
+    if (caseSensitive) {
+        return text.find(needle) != std::string_view::npos;
+    }
+
+    const auto first = static_cast<unsigned char>(needle[0]);
+    const std::size_t last = text.size() - needle.size();
+    for (std::size_t i = 0; i <= last; ++i) {
+        if (lowerAscii(text[i]) != first) {
+            continue;
+        }
+        std::size_t k = 1;
+        while (k < needle.size() && lowerAscii(text[i + k]) == static_cast<unsigned char>(needle[k])) {
+            ++k;
+        }
+        if (k == needle.size()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+} // namespace
 
 Matcher::Matcher(std::string_view pattern, MatchOptions options)
     : options_(options) {
+    if (options.regex) {
+        auto flags = std::regex::ECMAScript | std::regex::optimize;
+        if (!options.caseSensitive) {
+            flags |= std::regex::icase;
+        }
+        const std::string source = options.ignoreAccents
+            ? utf8::encode(utf8::normalize(pattern, false, true))
+            : std::string(pattern);
+        try {
+            regex_ = std::regex(source, flags);
+        } catch (const std::regex_error& error) {
+            throw std::invalid_argument("Invalid regular expression '" + std::string(pattern) +
+                                        "': " + error.what());
+        }
+        return;
+    }
+
     const std::u32string p =
         utf8::normalize(pattern, !options.caseSensitive, options.ignoreAccents);
 
@@ -104,9 +165,57 @@ bool Matcher::matchesSingle(const Token& token, char32_t c) {
     return false;
 }
 
+Matcher Matcher::literal(std::string_view text, MatchOptions options) {
+    options.regex = false;
+    std::string pattern = "*";
+    for (const char c : text) {
+        if (c == '*' || c == '?' || c == '[' || c == '\\') {
+            pattern += '\\';
+        }
+        pattern += c;
+    }
+    pattern += '*';
+
+    Matcher matcher(pattern, options);
+
+    matcher.useLiteral_ = !text.empty();
+    matcher.literal_ = utf8::normalize(text, !options.caseSensitive, options.ignoreAccents);
+
+    bool ascii = !text.empty() && isAscii(text);
+    if (ascii) {
+        matcher.useNeedle_ = true;
+        matcher.needle_.reserve(text.size());
+        for (const char c : text) {
+            matcher.needle_ += options.caseSensitive ? c : static_cast<char>(lowerAscii(c));
+        }
+    }
+    return matcher;
+}
+
 bool Matcher::matches(std::string_view text) const {
-    const std::u32string t =
-        utf8::normalize(text, !options_.caseSensitive, options_.ignoreAccents);
+    if (options_.regex) {
+        // std::regex can recurse deeply on huge inputs; cap what we feed it.
+        constexpr std::size_t kMaxRegexInput = 64 * 1024;
+        const std::string_view input = text.substr(0, kMaxRegexInput);
+        if (options_.ignoreAccents) {
+            const std::string subject = utf8::encode(utf8::normalize(input, false, true));
+            return std::regex_search(subject.data(), subject.data() + subject.size(), regex_);
+        }
+        return std::regex_search(input.data(), input.data() + input.size(), regex_);
+    }
+
+    // Pure-ASCII text can never differ because of accents, so a plain byte search is exact.
+    if (useNeedle_ && isAscii(text)) {
+        return asciiContains(text, needle_, options_.caseSensitive);
+    }
+
+    thread_local std::u32string buffer;
+    utf8::normalizeInto(text, !options_.caseSensitive, options_.ignoreAccents, buffer);
+    const std::u32string& t = buffer;
+
+    if (useLiteral_) {
+        return t.find(literal_) != std::u32string::npos;
+    }
 
     // Iterative matching with backtracking only to the latest '*': O(n*m) worst case.
     std::size_t textPos = 0;

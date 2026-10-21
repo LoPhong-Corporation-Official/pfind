@@ -8,7 +8,11 @@
 #include <algorithm>
 #include <fstream>
 #include <iostream>
+#include <map>
+#include <optional>
 #include <set>
+#include <stdexcept>
+#include <vector>
 #include <string>
 
 namespace fs = std::filesystem;
@@ -130,10 +134,75 @@ void testCli() {
     CHECK(!CLIParser::parse({"pfind", ".", "--min-size", "5k", "--max-size", "1k"}).valid);
     CHECK(!CLIParser::parse({"pfind", "--case-sensitive"}).valid);  // missing path
     CHECK(!CLIParser::parse({"pfind", ".", "--json", "--print0"}).valid);
+    CHECK(!CLIParser::parse({"pfind", ".", "-l"}).valid);                      // needs --grep
+    CHECK(!CLIParser::parse({"pfind", ".", "--max-lines", "3"}).valid);        // needs --grep
+    CHECK(!CLIParser::parse({"pfind", ".", "-g", "x", "--type", "dir"}).valid);
+    CHECK(CLIParser::parse({"pfind", ".", "-g", "x", "-l", "-E"}).valid);
+    {
+        auto c = CLIParser::parse({"pfind", ".", "-g", "x", "-A", "2", "-B", "3", "-j", "4"});
+        CHECK(c.valid && c.options.afterContext == 2 && c.options.beforeContext == 3 && c.options.jobs == 4u);
+        auto both = CLIParser::parse({"pfind", ".", "-g", "x", "-C", "5"});
+        CHECK(both.valid && both.options.afterContext == 5 && both.options.beforeContext == 5);
+    }
+    CHECK(CLIParser::parse({"pfind", ".", "--color=always"}).output.color == pfind::ColorMode::Always);
+    CHECK(CLIParser::parse({"pfind", ".", "--color", "never"}).output.color == pfind::ColorMode::Never);
+    CHECK(!CLIParser::parse({"pfind", ".", "--color=rainbow"}).valid);
+    CHECK(!CLIParser::parse({"pfind", ".", "-C", "2"}).valid);                 // needs --grep
+    CHECK(!CLIParser::parse({"pfind", ".", "-j", "2"}).valid);                 // needs --grep
+    CHECK(!CLIParser::parse({"pfind", ".", "-g", "x", "-j", "0"}).valid);
+    CHECK(!CLIParser::parse({"pfind", ".", "-g", "x", "-C", "99999"}).valid);
+    CHECK(!CLIParser::parse({"pfind", ".", "-E"}).valid);                      // needs --grep
 
     // "--" lets a pattern start with a dash.
     auto dash = CLIParser::parse({"pfind", ".", "--", "-weird*"});
     CHECK(dash.valid && dash.options.patterns.size() == 1);
+}
+
+void testRegex() {
+    pfind::MatchOptions options;
+    options.regex = true;
+
+    CHECK(pfind::Matcher("^main\\.(cpp|hpp)$", options).matches("main.cpp"));
+    CHECK(!pfind::Matcher("^main\\.(cpp|hpp)$", options).matches("main.c"));
+    CHECK(pfind::Matcher("\\d{4}-\\d{2}", options).matches("report-2026-10.txt"));  // search semantics
+    CHECK(pfind::Matcher("README", options).matches("readme.md"));                      // case-insensitive
+    options.caseSensitive = true;
+    CHECK(!pfind::Matcher("README", options).matches("readme.md"));
+
+    options.ignoreAccents = true;
+    CHECK(pfind::Matcher("^Bao cao", options).matches("Báo cáo.txt"));
+
+    bool threw = false;
+    try {
+        pfind::Matcher bad("([unclosed", options);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    CHECK(threw);
+
+    // Literal substring helper escapes wildcard characters.
+    CHECK(pfind::Matcher::literal("a*b").matches("xx a*b yy"));
+    CHECK(!pfind::Matcher::literal("a*b").matches("xx aXb yy"));
+    CHECK(pfind::Matcher::literal("TODO").matches("// todo: fix"));
+
+    // Fast paths must agree with the general matcher.
+    {
+        pfind::MatchOptions cs;
+        cs.caseSensitive = true;
+        CHECK(!pfind::Matcher::literal("TODO", cs).matches("// todo: fix"));
+        CHECK(pfind::Matcher::literal("TODO", cs).matches("// TODO: fix"));
+        CHECK(!pfind::Matcher::literal("needle").matches("need"));      // needle longer than text
+        CHECK(pfind::Matcher::literal("needle").matches("needle"));
+        CHECK(!pfind::Matcher::literal("needle").matches(""));
+        CHECK(pfind::Matcher::literal("abc").matches("xxabxabc"));      // partial overlap before the hit
+
+        pfind::MatchOptions accents;
+        accents.ignoreAccents = true;
+        CHECK(pfind::Matcher::literal("cafe", accents).matches("Quán CAFÉ nhỏ"));     // ASCII needle, accented text
+        CHECK(pfind::Matcher::literal("liệu", accents).matches("Tai LIEU"));          // accented needle, plain text
+        CHECK(!pfind::Matcher::literal("cafe").matches("Quán CAFÉ nhỏ"));
+        CHECK(pfind::Matcher::literal("CAFÉ").matches("quán café nhỏ"));              // Unicode case folding
+    }
 }
 
 void touch(const fs::path& path, const std::string& content = "x") {
@@ -229,6 +298,147 @@ void testEngine() {
         CHECK(!engine.errors().empty());
     }
 
+    {
+        // Content search.
+        touch(root / "notes" / "one.txt", "first line\nTODO: fix this\r\nlast TODO here\n");
+        touch(root / "notes" / "two.txt", "nothing to see\n");
+        touch(root / "notes" / "three.txt", "Cần làm: sửa lỗi\n");
+        touch(root / "notes" / "bin.dat", std::string("TODO\0binary", 11));
+
+        auto options = base;
+        options.patterns = {"*.txt", "*.dat"};
+        options.contentPattern = "todo";
+        CHECK((names(options) == std::set<std::string>{"one.txt"}));  // binary file skipped
+
+        pfind::SearchEngine engine(options);
+        std::vector<pfind::FileInfo> hits;
+        engine.search([&](const pfind::FileInfo& info) { hits.push_back(info); });
+        CHECK(hits.size() == 1);
+        CHECK(hits.size() == 1 && hits[0].matches.size() == 2);
+        CHECK(hits.size() == 1 && hits[0].matches[0].line == 2);
+        CHECK(hits.size() == 1 && hits[0].matches[0].text == "TODO: fix this");  // CR stripped
+
+        options.filesWithMatches = true;
+        pfind::SearchEngine first(options);
+        std::size_t perFile = 0;
+        first.search([&](const pfind::FileInfo& info) { perFile = info.matches.size(); });
+        CHECK(perFile == 1);
+
+        options.filesWithMatches = false;
+        options.maxLinesPerFile = 1;
+        pfind::SearchEngine limited(options);
+        limited.search([&](const pfind::FileInfo& info) { perFile = info.matches.size(); });
+        CHECK(perFile == 1);
+
+        auto accents = base;
+        accents.patterns = {"*.txt"};
+        accents.contentPattern = "can lam: sua loi";
+        CHECK(names(accents).empty());
+        accents.ignoreAccents = true;
+        CHECK((names(accents) == std::set<std::string>{"three.txt"}));
+
+        auto rx = base;
+        rx.patterns = {"*.txt"};   // names stay wildcards; only the content is a regex
+        rx.contentRegex = true;
+        rx.contentPattern = "^last\\s+TODO";
+        CHECK((names(rx) == std::set<std::string>{"one.txt"}));
+
+        // Chunked line reader: lines that straddle the 256 KB read buffer, a last line without
+        // a trailing newline, CRLF endings, empty files and over-long lines.
+        touch(root / "edge" / "boundary.txt",
+              std::string(262140, 'x') + "\nNEEDLE two\n" + std::string(300000, 'y') + "NEEDLE-end");
+        touch(root / "edge" / "crlf.txt", "one\r\nNEEDLE two\r\nthree\r\n");
+        touch(root / "edge" / "empty.txt", "");
+        touch(root / "edge" / "longline.txt", std::string(2 * 1024 * 1024, 'a') + "\nNEEDLE\n");
+
+        auto edge = base;
+        edge.root = root / "edge";
+        edge.contentPattern = "NEEDLE";
+        edge.jobs = 1;
+        std::map<std::string, std::vector<pfind::ContentMatch>> edgeHits;
+        pfind::SearchEngine edgeEngine(edge);
+        edgeEngine.search([&](const pfind::FileInfo& info) {
+            edgeHits[pfind::utf8::fromPath(info.path.filename())] = info.matches;
+        });
+        CHECK(edgeHits.size() == 2);   // empty.txt and longline.txt are not reported
+        CHECK(edgeHits["boundary.txt"].size() == 2);
+        CHECK(edgeHits["boundary.txt"].size() == 2 && edgeHits["boundary.txt"][0].line == 2);
+        CHECK(edgeHits["boundary.txt"].size() == 2 && edgeHits["boundary.txt"][1].line == 3);
+        CHECK(edgeHits["crlf.txt"].size() == 1 && edgeHits["crlf.txt"][0].text == "NEEDLE two");
+
+        // Context lines.
+        touch(root / "ctx" / "c.txt", "a\nb\nTODO c\nd\ne\nf\nTODO g\nh\n");
+        auto ctx = base;
+        ctx.patterns = {"c.txt"};
+        ctx.contentPattern = "TODO";
+        ctx.beforeContext = 1;
+        ctx.afterContext = 1;
+        std::vector<pfind::FileInfo> ctxHits;
+        pfind::SearchEngine ctxEngine(ctx);
+        ctxEngine.search([&](const pfind::FileInfo& info) { ctxHits.push_back(info); });
+        CHECK(ctxHits.size() == 1);
+        if (ctxHits.size() == 1) {
+            const auto& m = ctxHits[0].matches;
+            CHECK(m.size() == 6);
+            const std::size_t lines[] = {2, 3, 4, 6, 7, 8};
+            const bool contexts[] = {true, false, true, true, false, true};
+            for (std::size_t i = 0; i < m.size() && i < 6; ++i) {
+                CHECK(m[i].line == lines[i]);
+                CHECK(m[i].context == contexts[i]);
+            }
+        }
+
+        // maxLinesPerFile counts matches only; trailing context is still delivered.
+        ctx.maxLinesPerFile = 1;
+        pfind::SearchEngine ctxLimited(ctx);
+        std::size_t shown = 0;
+        ctxLimited.search([&](const pfind::FileInfo& info) { shown = info.matches.size(); });
+        CHECK(shown == 3);  // b, TODO c, d
+
+        auto badRx = rx;
+        badRx.contentPattern = "([";
+        bool threw = false;
+        try { pfind::SearchEngine broken(badRx); } catch (const std::invalid_argument&) { threw = true; }
+        CHECK(threw);
+    }
+
+    {
+        auto options = base;
+        options.regex = true;
+        options.patterns = {"^[a-d]\\.cpp$"};
+        CHECK((names(options) == std::set<std::string>{"a.cpp", "c.cpp", "d.cpp"}));
+    }
+
+    {
+        // Parallel scanning must give exactly the same results, in the same order, as one thread.
+        const fs::path bulk = root / "bulk";
+        for (int i = 0; i < 400; ++i) {
+            touch(bulk / ("dir" + std::to_string(i % 7)) / ("f" + std::to_string(i) + ".txt"),
+                  (i % 3 == 0) ? "needle here\n" : "nothing\n");
+        }
+
+        auto collect = [&](unsigned jobs, std::optional<std::size_t> limit) {
+            auto options = base;
+            options.root = bulk;
+            options.contentPattern = "needle";
+            options.jobs = jobs;
+            options.maxResults = limit;
+            std::vector<std::string> paths;
+            pfind::SearchEngine engine(options);
+            engine.search([&](const pfind::FileInfo& info) { paths.push_back(pfind::utf8::fromPath(info.path)); });
+            return paths;
+        };
+
+        const auto single = collect(1, std::nullopt);
+        CHECK(single.size() == 134);
+        CHECK(collect(4, std::nullopt) == single);
+        CHECK(collect(8, std::nullopt) == single);
+
+        const auto limitedSingle = collect(1, 5);
+        CHECK(limitedSingle.size() == 5);
+        CHECK(collect(4, 5) == limitedSingle);
+    }
+
 #ifndef _WIN32
     {
         // Symlink loop must terminate and produce a warning, not hang.
@@ -255,6 +465,7 @@ int main() {
     testWildcard();
     testUtf8();
     testFormat();
+    testRegex();
     testCli();
     testEngine();
 

@@ -1,6 +1,7 @@
 #include "Utf8.hpp"
 
 #include <algorithm>
+#include <array>
 #include <iterator>
 
 namespace pfind::utf8 {
@@ -19,47 +20,57 @@ constexpr char32_t kEscapeBase = 0xDC00;
 
 } // namespace
 
+namespace {
+
+// Decodes one code point starting at text[i]; returns the number of bytes consumed (>= 1).
+std::size_t decodeOne(std::string_view text, std::size_t i, char32_t& cp) {
+    const auto b0 = static_cast<unsigned char>(text[i]);
+    if (b0 < 0x80) {
+        cp = b0;
+        return 1;
+    }
+
+    std::size_t length = 0;
+    char32_t value = 0;
+    char32_t minimum = 0;
+
+    if ((b0 & 0xE0) == 0xC0) {
+        length = 2; value = b0 & 0x1F; minimum = 0x80;
+    } else if ((b0 & 0xF0) == 0xE0) {
+        length = 3; value = b0 & 0x0F; minimum = 0x800;
+    } else if ((b0 & 0xF8) == 0xF0) {
+        length = 4; value = b0 & 0x07; minimum = 0x10000;
+    }
+
+    bool ok = length != 0 && i + length <= text.size();
+    for (std::size_t k = 1; ok && k < length; ++k) {
+        const auto b = static_cast<unsigned char>(text[i + k]);
+        if ((b & 0xC0) != 0x80) {
+            ok = false;
+        } else {
+            value = (value << 6) | (b & 0x3F);
+        }
+    }
+
+    if (ok && value >= minimum && value <= 0x10FFFF && !(value >= 0xD800 && value <= 0xDFFF)) {
+        cp = value;
+        return length;
+    }
+
+    cp = kEscapeBase + b0;  // invalid byte: keep it, losslessly
+    return 1;
+}
+
+} // namespace
+
 std::u32string decode(std::string_view text) {
     std::u32string out;
     out.reserve(text.size());
 
-    std::size_t i = 0;
-    while (i < text.size()) {
-        const auto b0 = static_cast<unsigned char>(text[i]);
-
-        std::size_t length = 0;
+    for (std::size_t i = 0; i < text.size();) {
         char32_t cp = 0;
-        char32_t minimum = 0;
-
-        if (b0 < 0x80) {
-            out.push_back(b0);
-            ++i;
-            continue;
-        } else if ((b0 & 0xE0) == 0xC0) {
-            length = 2; cp = b0 & 0x1F; minimum = 0x80;
-        } else if ((b0 & 0xF0) == 0xE0) {
-            length = 3; cp = b0 & 0x0F; minimum = 0x800;
-        } else if ((b0 & 0xF8) == 0xF0) {
-            length = 4; cp = b0 & 0x07; minimum = 0x10000;
-        }
-
-        bool ok = length != 0 && i + length <= text.size();
-        for (std::size_t k = 1; ok && k < length; ++k) {
-            const auto b = static_cast<unsigned char>(text[i + k]);
-            if ((b & 0xC0) != 0x80) {
-                ok = false;
-            } else {
-                cp = (cp << 6) | (b & 0x3F);
-            }
-        }
-
-        if (ok && cp >= minimum && cp <= 0x10FFFF && !(cp >= 0xD800 && cp <= 0xDFFF)) {
-            out.push_back(cp);
-            i += length;
-        } else {
-            out.push_back(kEscapeBase + b0);
-            ++i;
-        }
+        i += decodeOne(text, i, cp);
+        out.push_back(cp);
     }
 
     return out;
@@ -140,25 +151,60 @@ bool isCombiningMark(char32_t cp) noexcept {
     return cp >= 0x0300 && cp <= 0x036F;
 }
 
+namespace {
+
+// Direct lookup tables for the two ranges the accent table covers (built once, thread-safe).
+struct AccentLookup {
+    static constexpr char32_t kLowStart = 0x00C0;
+    static constexpr char32_t kLowEnd = 0x024F;
+    static constexpr char32_t kHighStart = 0x1E00;
+    static constexpr char32_t kHighEnd = 0x1EFF;
+
+    std::array<char32_t, kLowEnd - kLowStart + 1> low{};
+    std::array<char32_t, kHighEnd - kHighStart + 1> high{};
+
+    AccentLookup() {
+        for (std::size_t i = 0; i < low.size(); ++i) {
+            low[i] = static_cast<char32_t>(kLowStart + i);
+        }
+        for (std::size_t i = 0; i < high.size(); ++i) {
+            high[i] = static_cast<char32_t>(kHighStart + i);
+        }
+        for (const AccentEntry& entry : kAccentTable) {
+            if (entry.from >= kLowStart && entry.from <= kLowEnd) {
+                low[entry.from - kLowStart] = entry.to;
+            } else if (entry.from >= kHighStart && entry.from <= kHighEnd) {
+                high[entry.from - kHighStart] = entry.to;
+            }
+        }
+    }
+};
+
+} // namespace
+
 char32_t stripAccent(char32_t cp) noexcept {
-    if (cp < 0x00C0) {
+    if (cp < AccentLookup::kLowStart) {
         return cp;
     }
 
-    const auto* begin = std::begin(kAccentTable);
-    const auto* end = std::end(kAccentTable);
-    const auto* it = std::lower_bound(
-        begin, end, cp, [](const AccentEntry& entry, char32_t value) { return entry.from < value; });
-
-    return (it != end && it->from == cp) ? it->to : cp;
+    static const AccentLookup lookup;
+    if (cp <= AccentLookup::kLowEnd) {
+        return lookup.low[cp - AccentLookup::kLowStart];
+    }
+    if (cp >= AccentLookup::kHighStart && cp <= AccentLookup::kHighEnd) {
+        return lookup.high[cp - AccentLookup::kHighStart];
+    }
+    return cp;
 }
 
-std::u32string normalize(std::string_view text, bool foldCaseToo, bool removeAccents) {
-    std::u32string decoded = decode(text);
-    std::u32string out;
-    out.reserve(decoded.size());
+void normalizeInto(std::string_view text, bool foldCaseToo, bool removeAccents, std::u32string& out) {
+    out.clear();
+    out.reserve(text.size());
 
-    for (char32_t cp : decoded) {
+    for (std::size_t i = 0; i < text.size();) {
+        char32_t cp = 0;
+        i += decodeOne(text, i, cp);
+
         if (removeAccents) {
             if (isCombiningMark(cp)) {
                 continue;
@@ -170,7 +216,11 @@ std::u32string normalize(std::string_view text, bool foldCaseToo, bool removeAcc
         }
         out.push_back(cp);
     }
+}
 
+std::u32string normalize(std::string_view text, bool foldCaseToo, bool removeAccents) {
+    std::u32string out;
+    normalizeInto(text, foldCaseToo, removeAccents, out);
     return out;
 }
 

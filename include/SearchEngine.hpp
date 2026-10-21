@@ -6,6 +6,7 @@
 #include "Wildcard.hpp"
 
 #include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -15,6 +16,7 @@ using SearchCallback = std::function<void(const FileInfo&)>;
 
 class SearchEngine {
 public:
+    // Throws std::invalid_argument for an invalid regular expression.
     explicit SearchEngine(SearchOptions options);
 
     // Walks the tree and invokes the callback for every matching entry.
@@ -31,6 +33,7 @@ private:
     SearchOptions options_;
     std::vector<Matcher> includes_;
     std::vector<Matcher> excludes_;
+    std::optional<Matcher> contentMatcher_;
 
     mutable std::vector<std::string> errors_;
     mutable bool rootFailed_{false};

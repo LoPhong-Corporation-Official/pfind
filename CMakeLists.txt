@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(pfind VERSION 1.1.0 LANGUAGES CXX)
+project(pfind VERSION 1.4.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -21,6 +21,9 @@ add_library(pfind_core STATIC
     src/Utf8.cpp
     src/Wildcard.cpp
 )
+
+find_package(Threads REQUIRED)
+target_link_libraries(pfind_core PUBLIC Threads::Threads)
 
 target_include_directories(pfind_core PUBLIC include PRIVATE src)
 target_compile_features(pfind_core PUBLIC cxx_std_20)

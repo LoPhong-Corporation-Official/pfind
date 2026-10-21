@@ -22,12 +22,22 @@ struct SearchOptions {
     std::vector<std::string> excludes;
 
     EntryType type{EntryType::File};
+    bool regex{false};           // name patterns and excludes are regular expressions
+    bool contentRegex{false};    // the --grep text is a regular expression
     bool caseSensitive{false};
     bool ignoreAccents{false};
     bool matchFullPath{false};   // match against the path relative to root instead of the name
     bool followSymlinks{false};
     bool showDetails{false};
     bool collectMetadata{false}; // fill size/time even without filters (sorting, JSON output)
+
+    // Content search: only report files that contain this text (binary files are skipped).
+    std::optional<std::string> contentPattern;
+    bool filesWithMatches{false};                     // stop at the first matching line per file
+    std::optional<std::size_t> maxLinesPerFile;
+    std::size_t beforeContext{0};                     // lines shown before each match
+    std::size_t afterContext{0};                      // lines shown after each match
+    std::optional<unsigned> jobs;                     // content-scan threads (default: automatic)
 
     std::optional<unsigned> maxDepth;                 // 1 = direct children of root
     std::optional<std::uintmax_t> minSize;            // bytes

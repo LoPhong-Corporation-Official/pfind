@@ -2,8 +2,16 @@
 
 #include "Utf8.hpp"
 
+#include <algorithm>
+#include <atomic>
+#include <cstring>
+#include <deque>
+#include <fstream>
 #include <memory>
+#include <string_view>
 #include <system_error>
+#include <thread>
+#include <vector>
 
 namespace pfind {
 namespace fs = std::filesystem;
@@ -31,6 +39,198 @@ bool isAncestor(const std::shared_ptr<const AncestorNode>& chain, const fs::path
     return false;
 }
 
+struct ScanSettings {
+    std::size_t maxMatches;
+    std::size_t before;
+    std::size_t after;
+};
+
+std::string shorten(std::string_view line) {
+    constexpr std::size_t kMaxShownBytes = 300;
+    if (line.size() <= kMaxShownBytes) {
+        return std::string(line);
+    }
+
+    std::size_t cut = kMaxShownBytes;
+    // Do not cut inside a UTF-8 sequence.
+    while (cut > 0 && (static_cast<unsigned char>(line[cut]) & 0xC0) == 0x80) {
+        --cut;
+    }
+    return std::string(line.substr(0, cut)) + "...";
+}
+
+// Reads lines from a stream in large chunks. Lines are returned as views into the internal buffer
+// (valid until the next call), which avoids a copy per line.
+class LineReader {
+public:
+    explicit LineReader(std::ifstream& in) : in_(in), buffer_(threadBuffer()) {
+        refill();
+    }
+
+    // The first bytes of the file, for binary detection.
+    std::string_view head(std::size_t count) const {
+        return std::string_view(buffer_.data(), std::min(count, end_));
+    }
+
+    // False at end of input, or when a line exceeds the size limit (see tooLong()).
+    bool next(std::string_view& out) {
+        carry_.clear();
+        bool haveCarry = false;
+
+        for (;;) {
+            if (pos_ == end_ && !refill()) {
+                if (haveCarry) {
+                    out = carry_;
+                    return true;
+                }
+                return false;
+            }
+
+            const char* base = buffer_.data() + pos_;
+            const std::size_t available = end_ - pos_;
+            const void* newline = std::memchr(base, '\n', available);
+
+            if (newline != nullptr) {
+                const auto length = static_cast<std::size_t>(static_cast<const char*>(newline) - base);
+                pos_ += length + 1;
+                if (!haveCarry) {
+                    out = std::string_view(base, length);
+                } else {
+                    carry_.append(base, length);
+                    out = carry_;
+                }
+                return true;
+            }
+
+            // Line continues in the next chunk.
+            carry_.append(base, available);
+            haveCarry = true;
+            pos_ = end_;
+            if (carry_.size() > kMaxLineBytes) {
+                tooLong_ = true;
+                return false;
+            }
+        }
+    }
+
+    bool tooLong() const noexcept { return tooLong_; }
+
+    static constexpr std::size_t kMaxLineBytes = 1 << 20;   // longer lines are treated as binary data
+
+private:
+    static std::vector<char>& threadBuffer() {
+        thread_local std::vector<char> buffer(256 * 1024);
+        return buffer;
+    }
+
+    bool refill() {
+        in_.read(buffer_.data(), static_cast<std::streamsize>(buffer_.size()));
+        end_ = static_cast<std::size_t>(in_.gcount());
+        pos_ = 0;
+        return end_ > 0;
+    }
+
+    std::ifstream& in_;
+    std::vector<char>& buffer_;
+    std::string carry_;
+    std::size_t pos_{0};
+    std::size_t end_{0};
+    bool tooLong_{false};
+};
+
+// Scans a text file line by line. Returns false (and no matches) for binary or unreadable files.
+// Context lines are added to `out` flagged with context = true; they never count as matches.
+bool scanFile(const fs::path& path,
+              const Matcher& matcher,
+              const ScanSettings& settings,
+              std::vector<ContentMatch>& out,
+              std::string& error) {
+    constexpr std::size_t kProbeSize = 8192;
+
+    try {
+        std::ifstream in(path, std::ios::binary);
+        if (!in) {
+            error = "Cannot open file";
+            return false;
+        }
+
+        LineReader reader(in);
+
+        // Binary detection: a NUL byte near the start.
+        if (reader.head(kProbeSize).find('\0') != std::string_view::npos) {
+            return false;
+        }
+
+        std::deque<ContentMatch> beforeBuffer;
+        std::size_t matches = 0;
+        std::size_t afterRemaining = 0;
+        bool limitReached = false;
+        std::size_t lineNumber = 0;
+        std::string_view line;
+
+        while (reader.next(line)) {
+            ++lineNumber;
+            if (!line.empty() && line.back() == '\r') {
+                line.remove_suffix(1);
+            }
+
+            if (limitReached) {
+                // Only trailing context is still wanted.
+                if (afterRemaining == 0) {
+                    break;
+                }
+                out.push_back({lineNumber, shorten(line), true});
+                --afterRemaining;
+                continue;
+            }
+
+            if (matcher.matches(line)) {
+                for (auto& previous : beforeBuffer) {
+                    out.push_back(std::move(previous));
+                }
+                beforeBuffer.clear();
+
+                out.push_back({lineNumber, shorten(line), false});
+                ++matches;
+                afterRemaining = settings.after;
+
+                if (matches >= settings.maxMatches) {
+                    limitReached = true;
+                    if (afterRemaining == 0) {
+                        break;
+                    }
+                }
+            } else if (afterRemaining > 0) {
+                out.push_back({lineNumber, shorten(line), true});
+                --afterRemaining;
+            } else if (settings.before > 0) {
+                beforeBuffer.push_back({lineNumber, shorten(line), true});
+                if (beforeBuffer.size() > settings.before) {
+                    beforeBuffer.pop_front();
+                }
+            }
+        }
+
+        return matches > 0;
+    } catch (const std::exception& exception) {
+        // e.g. std::regex running out of resources on pathological input.
+        out.clear();
+        error = std::string("Content scan failed (") + exception.what() + ")";
+        return false;
+    }
+}
+
+struct PendingScan {
+    FileInfo info;
+    fs::path path;
+};
+
+struct ScanResult {
+    bool found{false};
+    std::vector<ContentMatch> matches;
+    std::string error;
+};
+
 } // namespace
 
 SearchEngine::SearchEngine(SearchOptions options)
@@ -39,11 +239,21 @@ SearchEngine::SearchEngine(SearchOptions options)
     matchOptions.caseSensitive = options_.caseSensitive;
     matchOptions.ignoreAccents = options_.ignoreAccents;
 
+    MatchOptions nameOptions = matchOptions;
+    nameOptions.regex = options_.regex;
+
     for (const auto& pattern : options_.patterns) {
-        includes_.emplace_back(pattern, matchOptions);
+        includes_.emplace_back(pattern, nameOptions);
     }
     for (const auto& pattern : options_.excludes) {
-        excludes_.emplace_back(pattern, matchOptions);
+        excludes_.emplace_back(pattern, nameOptions);
+    }
+
+    if (options_.contentPattern) {
+        MatchOptions contentOptions = matchOptions;
+        contentOptions.regex = options_.contentRegex;
+        contentMatcher_ = options_.contentRegex ? Matcher(*options_.contentPattern, contentOptions)
+                                                : Matcher::literal(*options_.contentPattern, contentOptions);
     }
 }
 
@@ -106,6 +316,71 @@ std::size_t SearchEngine::search(const SearchCallback& callback) const {
                               options_.showDetails || options_.collectMetadata;
 
     std::size_t count = 0;
+
+    // ---- content scanning (optionally parallel, results always in traversal order) ----
+    constexpr std::size_t kBatchSize = 128;
+
+    ScanSettings scanSettings{
+        options_.filesWithMatches ? 1 : options_.maxLinesPerFile.value_or(static_cast<std::size_t>(-1)),
+        options_.filesWithMatches ? 0 : options_.beforeContext,
+        options_.filesWithMatches ? 0 : options_.afterContext,
+    };
+
+    unsigned jobs = 1;
+    if (contentMatcher_) {
+        jobs = options_.jobs.value_or(std::clamp(std::thread::hardware_concurrency(), 1u, 8u));
+        jobs = std::max(jobs, 1u);
+    }
+
+    std::vector<PendingScan> batch;
+
+    // Scans the queued files and reports the hits in order. Returns true once maxResults is reached.
+    auto flush = [&]() -> bool {
+        if (batch.empty()) {
+            return false;
+        }
+
+        std::vector<ScanResult> results(batch.size());
+        std::atomic<std::size_t> next{0};
+
+        auto worker = [&]() {
+            for (;;) {
+                const std::size_t i = next.fetch_add(1);
+                if (i >= batch.size()) {
+                    break;
+                }
+                results[i].found = scanFile(batch[i].path, *contentMatcher_, scanSettings,
+                                            results[i].matches, results[i].error);
+            }
+        };
+
+        const std::size_t threadCount = std::min<std::size_t>(jobs, batch.size());
+        std::vector<std::thread> pool;
+        for (std::size_t t = 1; t < threadCount; ++t) {
+            pool.emplace_back(worker);
+        }
+        worker();
+        for (auto& thread : pool) {
+            thread.join();
+        }
+
+        bool done = false;
+        for (std::size_t i = 0; i < batch.size() && !done; ++i) {
+            if (!results[i].error.empty()) {
+                addError(results[i].error + ": " + utf8::fromPath(batch[i].path));
+            }
+            if (results[i].found) {
+                batch[i].info.matches = std::move(results[i].matches);
+                callback(batch[i].info);
+                ++count;
+                done = options_.maxResults && count >= *options_.maxResults;
+            }
+        }
+
+        batch.clear();
+        return done;
+    };
+
     std::vector<PendingDirectory> stack;
     stack.push_back({options_.root, 1, rootAncestors});
 
@@ -241,6 +516,18 @@ std::size_t SearchEngine::search(const SearchCallback& callback) const {
                         }
                     }
 
+                    if (accepted && contentMatcher_) {
+                        if (!isRegular) {
+                            accepted = false;  // only regular files have content
+                        } else {
+                            batch.push_back({std::move(info), entryPath});
+                            accepted = false;  // reported by flush(), in order
+                            if (batch.size() >= kBatchSize && flush()) {
+                                return count;
+                            }
+                        }
+                    }
+
                     if (accepted) {
                         callback(info);
                         ++count;
@@ -267,6 +554,7 @@ std::size_t SearchEngine::search(const SearchCallback& callback) const {
         }
     }
 
+    flush();
     return count;
 }
 
