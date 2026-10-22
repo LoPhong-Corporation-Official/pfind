@@ -7,6 +7,7 @@
 #include <cstring>
 #include <deque>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <string_view>
 #include <system_error>
@@ -24,11 +25,78 @@ struct AncestorNode {
     std::shared_ptr<const AncestorNode> parent;
 };
 
+// Ignore rules of one directory, chained to those of its parent directories.
+struct IgnoreNode {
+    std::string base;   // directory of the ignore file, '/' separators, no trailing '/'
+    IgnoreRules rules;
+    std::shared_ptr<const IgnoreNode> parent;
+};
+
 struct PendingDirectory {
     fs::path path;
     unsigned depth;  // depth of the entries inside this directory (1-based)
     std::shared_ptr<const AncestorNode> ancestors;
+    std::shared_ptr<const IgnoreNode> ignores;   // rules of the parent directories
 };
+
+std::string directoryKey(const fs::path& dir) {
+    std::string key = utf8::fromPathGeneric(dir);
+    while (key.size() > 1 && key.back() == '/') {
+        key.pop_back();
+    }
+    if (key == "/") {
+        key.clear();   // so that base + "/" + name works for the file system root too
+    }
+    return key;
+}
+
+bool readTextFile(const fs::path& path, std::string& content) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        return false;
+    }
+    content.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    return true;
+}
+
+// Reads the ignore files `names` found in `dir` and chains them in front of `parent`.
+std::shared_ptr<const IgnoreNode> loadIgnoreNodes(const fs::path& dir,
+                                                  const std::vector<std::string>& names,
+                                                  std::shared_ptr<const IgnoreNode> parent) {
+    for (const std::string& name : names) {
+        std::string content;
+        if (!readTextFile(dir / utf8::toPath(name), content)) {
+            continue;
+        }
+        IgnoreRules rules = IgnoreRules::parse(content);
+        if (rules.empty()) {
+            continue;
+        }
+        parent = std::make_shared<IgnoreNode>(IgnoreNode{directoryKey(dir), std::move(rules), parent});
+    }
+    return parent;
+}
+
+// True if an enclosing ignore file ignores the entry (innermost file wins, last rule wins).
+bool isIgnored(const std::shared_ptr<const IgnoreNode>& chain,
+               const std::string& entryPath,
+               const std::string& name,
+               bool isDirectory) {
+    for (const IgnoreNode* node = chain.get(); node != nullptr; node = node->parent.get()) {
+        const std::string& base = node->base;
+        if (entryPath.size() <= base.size() + 1 || entryPath.compare(0, base.size(), base) != 0 ||
+            entryPath[base.size()] != '/') {
+            continue;
+        }
+
+        const std::string_view relative = std::string_view(entryPath).substr(base.size() + 1);
+        const auto verdict = node->rules.check(relative, name, isDirectory);
+        if (verdict != IgnoreRules::Verdict::None) {
+            return verdict == IgnoreRules::Verdict::Ignored;
+        }
+    }
+    return false;
+}
 
 bool isAncestor(const std::shared_ptr<const AncestorNode>& chain, const fs::path& canonical) {
     for (const AncestorNode* node = chain.get(); node != nullptr; node = node->parent.get()) {
@@ -43,20 +111,37 @@ struct ScanSettings {
     std::size_t maxMatches;
     std::size_t before;
     std::size_t after;
+    bool highlight;
 };
 
-std::string shorten(std::string_view line) {
+// How many bytes of a line are kept (never cutting inside a UTF-8 sequence).
+std::size_t shownLength(std::string_view line) {
     constexpr std::size_t kMaxShownBytes = 300;
     if (line.size() <= kMaxShownBytes) {
-        return std::string(line);
+        return line.size();
     }
 
     std::size_t cut = kMaxShownBytes;
-    // Do not cut inside a UTF-8 sequence.
     while (cut > 0 && (static_cast<unsigned char>(line[cut]) & 0xC0) == 0x80) {
         --cut;
     }
-    return std::string(line.substr(0, cut)) + "...";
+    return cut;
+}
+
+ContentMatch makeLine(std::size_t number, std::string_view line, bool context, const Matcher* highlighter) {
+    const std::size_t shown = shownLength(line);
+
+    ContentMatch result;
+    result.line = number;
+    result.context = context;
+    result.text = std::string(line.substr(0, shown));
+    if (shown < line.size()) {
+        result.text += "...";
+    }
+    if (highlighter != nullptr) {
+        result.ranges = highlighter->findAll(std::string_view(result.text).substr(0, shown));
+    }
+    return result;
 }
 
 // Reads lines from a stream in large chunks. Lines are returned as views into the internal buffer
@@ -179,7 +264,7 @@ bool scanFile(const fs::path& path,
                 if (afterRemaining == 0) {
                     break;
                 }
-                out.push_back({lineNumber, shorten(line), true});
+                out.push_back(makeLine(lineNumber, line, true, nullptr));
                 --afterRemaining;
                 continue;
             }
@@ -190,7 +275,7 @@ bool scanFile(const fs::path& path,
                 }
                 beforeBuffer.clear();
 
-                out.push_back({lineNumber, shorten(line), false});
+                out.push_back(makeLine(lineNumber, line, false, settings.highlight ? &matcher : nullptr));
                 ++matches;
                 afterRemaining = settings.after;
 
@@ -201,10 +286,10 @@ bool scanFile(const fs::path& path,
                     }
                 }
             } else if (afterRemaining > 0) {
-                out.push_back({lineNumber, shorten(line), true});
+                out.push_back(makeLine(lineNumber, line, true, nullptr));
                 --afterRemaining;
             } else if (settings.before > 0) {
-                beforeBuffer.push_back({lineNumber, shorten(line), true});
+                beforeBuffer.push_back(makeLine(lineNumber, line, true, nullptr));
                 if (beforeBuffer.size() > settings.before) {
                     beforeBuffer.pop_front();
                 }
@@ -303,9 +388,68 @@ std::size_t SearchEngine::search(const SearchCallback& callback) const {
         return 0;
     }
 
+    // Use a normalised root ("a/../b/" -> "b") so ignore-file prefixes line up with entry paths.
+    fs::path root = options_.root.lexically_normal();
+    if (!root.has_filename() && root.has_parent_path()) {
+        root = root.parent_path();
+    }
+
+    // ---- ignore files ----
+    std::vector<std::string> ignoreNames;
+    if (options_.useGitignore) {
+        ignoreNames.push_back(".gitignore");
+    }
+    ignoreNames.insert(ignoreNames.end(), options_.ignoreFiles.begin(), options_.ignoreFiles.end());
+    const bool ignoreActive = !ignoreNames.empty();
+
+    std::shared_ptr<const IgnoreNode> rootIgnores;
+    if (options_.useGitignore) {
+        // Find the enclosing git repository, if any.
+        fs::path repo;
+        for (fs::path dir = root;;) {
+            std::error_code gitEc;
+            if (fs::exists(dir / ".git", gitEc)) {
+                repo = dir;
+                break;
+            }
+            fs::path parent = dir.parent_path();
+            if (parent.empty() || parent == dir) {
+                break;
+            }
+            dir = parent;
+        }
+
+        if (!repo.empty()) {
+            // Lowest precedence first: info/exclude, then .gitignore from the repo root down to
+            // the directory above the search root (the root's own file is read during the walk).
+            rootIgnores = loadIgnoreNodes(repo / ".git" / "info", {"exclude"}, nullptr);
+            if (rootIgnores) {
+                // loadIgnoreNodes() based the node on the "info" directory; patterns in
+                // info/exclude are relative to the repository root.
+                auto fixed = std::make_shared<IgnoreNode>(
+                    IgnoreNode{directoryKey(repo), rootIgnores->rules, nullptr});
+                rootIgnores = fixed;
+            }
+
+            std::vector<fs::path> above;
+            for (fs::path dir = root.parent_path(); !dir.empty(); dir = dir.parent_path()) {
+                if (root == repo) {
+                    break;
+                }
+                above.push_back(dir);
+                if (dir == repo || dir == dir.parent_path()) {
+                    break;
+                }
+            }
+            for (auto it = above.rbegin(); it != above.rend(); ++it) {
+                rootIgnores = loadIgnoreNodes(*it, {".gitignore"}, rootIgnores);
+            }
+        }
+    }
+
     std::shared_ptr<const AncestorNode> rootAncestors;
     if (options_.followSymlinks) {
-        const fs::path canonicalRoot = fs::canonical(options_.root, ec);
+        const fs::path canonicalRoot = fs::canonical(root, ec);
         if (!ec) {
             rootAncestors = std::make_shared<AncestorNode>(AncestorNode{canonicalRoot, nullptr});
         }
@@ -324,6 +468,7 @@ std::size_t SearchEngine::search(const SearchCallback& callback) const {
         options_.filesWithMatches ? 1 : options_.maxLinesPerFile.value_or(static_cast<std::size_t>(-1)),
         options_.filesWithMatches ? 0 : options_.beforeContext,
         options_.filesWithMatches ? 0 : options_.afterContext,
+        options_.highlightMatches && !options_.filesWithMatches,
     };
 
     unsigned jobs = 1;
@@ -382,7 +527,7 @@ std::size_t SearchEngine::search(const SearchCallback& callback) const {
     };
 
     std::vector<PendingDirectory> stack;
-    stack.push_back({options_.root, 1, rootAncestors});
+    stack.push_back({root, 1, rootAncestors, rootIgnores});
 
     while (!stack.empty()) {
         PendingDirectory current = std::move(stack.back());
@@ -395,6 +540,10 @@ std::size_t SearchEngine::search(const SearchCallback& callback) const {
             ec.clear();
             continue;
         }
+
+        // Rules of this directory apply to its entries and to everything below.
+        const std::shared_ptr<const IgnoreNode> chain =
+            ignoreActive ? loadIgnoreNodes(current.path, ignoreNames, current.ignores) : nullptr;
 
         std::vector<PendingDirectory> children;
         const fs::directory_iterator end;
@@ -428,6 +577,18 @@ std::size_t SearchEngine::search(const SearchCallback& callback) const {
                 skip = true;
             }
 
+            if (!skip && options_.skipHidden && !name.empty() && name[0] == '.') {
+                skip = true;
+            }
+
+            if (!skip && options_.useGitignore && isDirectory && name == ".git") {
+                skip = true;   // never descend into the repository metadata
+            }
+
+            if (!skip && chain && isIgnored(chain, utf8::fromPathGeneric(entryPath), name, isDirectory)) {
+                skip = true;
+            }
+
             if (!skip) {
                 // Descend into directories (even if the directory itself is not reported).
                 const bool withinDepth = !options_.maxDepth || current.depth < *options_.maxDepth;
@@ -452,7 +613,7 @@ std::size_t SearchEngine::search(const SearchCallback& callback) const {
                     }
 
                     if (descend) {
-                        children.push_back({entryPath, current.depth + 1, childAncestors});
+                        children.push_back({entryPath, current.depth + 1, childAncestors, chain});
                     }
                 }
 
@@ -465,7 +626,7 @@ std::size_t SearchEngine::search(const SearchCallback& callback) const {
 
                 std::string relative;
                 if (typeOk && options_.matchFullPath) {
-                    relative = utf8::fromPathGeneric(entryPath.lexically_relative(options_.root));
+                    relative = utf8::fromPathGeneric(entryPath.lexically_relative(root));
                 }
 
                 if (typeOk && matchesInclude(name, relative)) {

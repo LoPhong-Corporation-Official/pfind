@@ -4,6 +4,8 @@
 #include <filesystem>
 #include <string>
 #include <string_view>
+#include <cstdint>
+#include <vector>
 
 namespace pfind::utf8 {
 
@@ -30,6 +32,15 @@ char32_t stripAccent(char32_t cp) noexcept;
 
 // Same as normalize(), but reuses the caller's buffer (no allocation in hot loops).
 void normalizeInto(std::string_view text, bool foldCaseToo, bool removeAccents, std::u32string& out);
+
+// Normalised text plus, for every normalised character, the byte range it came from in the
+// original text. A removed combining mark extends the range of the character before it.
+struct MappedText {
+    std::u32string text;
+    std::vector<std::uint32_t> begin;
+    std::vector<std::uint32_t> end;
+};
+void normalizeWithMap(std::string_view text, bool foldCaseToo, bool removeAccents, MappedText& out);
 
 // Decodes and optionally folds case and/or removes accents.
 std::u32string normalize(std::string_view text, bool foldCaseToo, bool removeAccents);

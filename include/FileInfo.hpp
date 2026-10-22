@@ -3,6 +3,8 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <cstdint>
+#include <utility>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -13,6 +15,8 @@ struct ContentMatch {
     std::size_t line{0};   // 1-based
     std::string text;      // the line (truncated if very long)
     bool context{false};   // true for surrounding lines shown with -A/-B/-C
+    // Byte ranges of the hits inside `text` (only with SearchOptions::highlightMatches).
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> ranges;
 };
 
 struct FileInfo {

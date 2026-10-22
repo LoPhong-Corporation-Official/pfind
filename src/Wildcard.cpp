@@ -2,6 +2,7 @@
 
 #include "Utf8.hpp"
 
+#include <iterator>
 #include <stdexcept>
 
 namespace pfind {
@@ -252,6 +253,102 @@ bool Matcher::matches(std::string_view text) const {
     }
 
     return tokenPos == tokens_.size();
+}
+
+std::vector<std::pair<std::uint32_t, std::uint32_t>> Matcher::findAll(std::string_view text,
+                                                                        std::size_t limit) const {
+    const std::size_t kMaxRanges = limit;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> ranges;
+
+    if (options_.regex) {
+        if (options_.ignoreAccents || text.size() > 64 * 1024) {
+            return ranges;   // positions would not map back to the original text
+        }
+        try {
+            std::cregex_iterator it(text.data(), text.data() + text.size(), regex_);
+            for (const std::cregex_iterator end; it != end && ranges.size() < kMaxRanges; ++it) {
+                if (it->length() == 0) {
+                    continue;
+                }
+                const auto start = static_cast<std::uint32_t>(it->position());
+                ranges.emplace_back(start, start + static_cast<std::uint32_t>(it->length()));
+            }
+        } catch (const std::regex_error&) {
+            ranges.clear();
+        }
+        return ranges;
+    }
+
+    if (!useLiteral_ || literal_.empty()) {
+        return ranges;
+    }
+
+    thread_local utf8::MappedText mapped;
+    utf8::normalizeWithMap(text, !options_.caseSensitive, options_.ignoreAccents, mapped);
+
+    std::size_t position = 0;
+    while (ranges.size() < kMaxRanges &&
+           (position = mapped.text.find(literal_, position)) != std::u32string::npos) {
+        const std::size_t last = position + literal_.size() - 1;
+        ranges.emplace_back(mapped.begin[position], mapped.end[last]);
+        position = last + 1;
+    }
+    return ranges;
+}
+
+std::string Matcher::replaceAll(std::string_view text,
+                                std::string_view replacement,
+                                std::size_t& count) const {
+    count = 0;
+
+    if (options_.regex) {
+        if (options_.ignoreAccents || text.size() > 64 * 1024) {
+            return std::string(text);
+        }
+
+        const std::string format(replacement);
+        std::string out;
+        std::size_t last = 0;
+        try {
+            std::cregex_iterator it(text.data(), text.data() + text.size(), regex_);
+            for (const std::cregex_iterator end; it != end; ++it) {
+                if (it->length() == 0) {
+                    continue;
+                }
+                const auto position = static_cast<std::size_t>(it->position());
+                out.append(text.substr(last, position - last));
+                it->format(std::back_inserter(out), format);
+                last = position + static_cast<std::size_t>(it->length());
+                ++count;
+            }
+        } catch (const std::regex_error&) {
+            count = 0;
+            return std::string(text);
+        }
+
+        if (count == 0) {
+            return std::string(text);
+        }
+        out.append(text.substr(last));
+        return out;
+    }
+
+    const auto ranges = findAll(text, static_cast<std::size_t>(-1));
+    if (ranges.empty()) {
+        return std::string(text);
+    }
+
+    std::string out;
+    out.reserve(text.size());
+    std::size_t last = 0;
+    for (const auto& [from, to] : ranges) {
+        out.append(text.substr(last, from - last));
+        out.append(replacement);
+        last = to;
+        ++count;
+    }
+    out.append(text.substr(last));
+    return out;
 }
 
 bool wildcardMatch(std::string_view text, std::string_view pattern, bool caseSensitive) {

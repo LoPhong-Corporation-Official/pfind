@@ -1,5 +1,6 @@
 #include "CLIParser.hpp"
 
+#include "Completion.hpp"
 #include "Format.hpp"
 #include "Utf8.hpp"
 
@@ -37,6 +38,7 @@ CLIResult CLIParser::parse(const std::vector<std::string>& args) {
     CLIResult result;
     SearchOptions& options = result.options;
     OutputOptions& output = result.output;
+    ReplaceOptions& replace = result.replace;
 
     if (args.size() <= 1) {
         result.showHelp = true;
@@ -103,12 +105,31 @@ CLIResult CLIParser::parse(const std::vector<std::string>& args) {
                 return result;
             }
 
+            if (name == "--completion") {
+                const std::string_view v = value();
+                if (!isCompletionShell(v)) {
+                    fail("Invalid value for --completion: '" + std::string(v) + "' (use bash, zsh or powershell).");
+                }
+                result.completionShell = std::string(v);
+                return result;
+            }
+
+            if (name == "--apply")  { noValue(); replace.apply = true;  continue; }
+            if (name == "--backup") { noValue(); replace.backup = true; continue; }
+
+            if (name == "--replace") {
+                replace.text = std::string(value());
+                continue;
+            }
+
             if (is(name, "-i", "--case-insensitive")) { noValue(); options.caseSensitive = false; continue; }
             if (is(name, "-s", "--case-sensitive"))   { noValue(); options.caseSensitive = true;  continue; }
             if (name == "--ignore-accents")           { noValue(); options.ignoreAccents = true;  continue; }
             if (is(name, "-r", "--regex"))            { noValue(); options.regex = true;          continue; }
             if (is(name, "-E", "--grep-regex"))       { noValue(); options.contentRegex = true;   continue; }
             if (is(name, "-l", "--files-with-matches")) { noValue(); options.filesWithMatches = true; continue; }
+            if (name == "--gitignore")                { noValue(); options.useGitignore = true;   continue; }
+            if (name == "--skip-hidden")              { noValue(); options.skipHidden = true;     continue; }
             if (name == "--full-path")                { noValue(); options.matchFullPath = true;  continue; }
             if (name == "--follow-symlinks")          { noValue(); options.followSymlinks = true; continue; }
             if (name == "--details")                  { noValue(); options.showDetails = true;    continue; }
@@ -170,6 +191,15 @@ CLIResult CLIParser::parse(const std::vector<std::string>& args) {
                     fail("Invalid value for --max-lines: '" + std::string(v) + "' (use 1 or more).");
                 }
                 options.maxLinesPerFile = *limit;
+                continue;
+            }
+
+            if (name == "--ignore-file") {
+                const std::string_view v = value();
+                if (v.empty() || v.find('/') != std::string_view::npos || v.find('\\') != std::string_view::npos) {
+                    fail("--ignore-file takes a file name (like .ignore), not a path.");
+                }
+                options.ignoreFiles.emplace_back(v);
                 continue;
             }
 
@@ -272,6 +302,23 @@ CLIResult CLIParser::parse(const std::vector<std::string>& args) {
             fail("--grep cannot be combined with --type dir.");
         }
 
+        if ((replace.apply || replace.backup) && !replace.text) {
+            fail("--apply and --backup need --replace.");
+        }
+        if (replace.text) {
+            if (!options.contentPattern) {
+                fail("--replace needs --grep (the text to find).");
+            }
+            if (options.contentRegex && options.ignoreAccents) {
+                fail("--replace cannot combine --grep-regex with --ignore-accents.");
+            }
+            if (output.json || output.null || output.countOnly || options.filesWithMatches ||
+                options.beforeContext > 0 || options.afterContext > 0 || options.maxLinesPerFile) {
+                fail("--replace cannot be combined with --json, --print0, --count, "
+                     "--files-with-matches, --max-lines or context options.");
+            }
+        }
+
         if (output.json && output.null) {
             fail("--json and --print0 cannot be combined.");
         }
@@ -316,6 +363,11 @@ void CLIParser::printHelp(const char* programName) {
         << "  -B, --before-context <n>      With --grep, also show n lines before each match\n"
         << "  -C, --context <n>             Both of the above\n"
         << "  -j, --jobs <n>                Threads used to scan file contents (default: automatic)\n\n"
+        << "Replace (preview by default):\n"
+        << "      --replace <text>          Replace every --grep match by <text>; shows what would change\n"
+        << "                                (with -E, $1 $2 ... and $& refer to the match)\n"
+        << "      --apply                   Actually write the changes (atomic, keeps permissions)\n"
+        << "      --backup                  Keep a copy of each changed file as <file>.bak\n\n"
         << "Filtering:\n"
         << "      --type <file|dir|all>     Kind of entry to report (default: file)\n"
         << "      --all                     Same as --type all\n"
@@ -324,7 +376,12 @@ void CLIParser::printHelp(const char* programName) {
         << "      --max-size <size>         Only files of at most this size\n"
         << "      --modified-within <time>  Only entries changed recently (e.g. 30m, 12h, 7d, 2w)\n"
         << "      --max-results <n>         Stop after n matches\n"
-        << "      --follow-symlinks         Follow directory symbolic links (loops are detected)\n\n"
+        << "      --follow-symlinks         Follow directory symbolic links (loops are detected)\n"
+        << "      --gitignore               Skip what .gitignore files exclude (also parent directories inside\n"
+        << "                                a git repository and .git/info/exclude); never enters .git\n"
+        << "      --ignore-file <name>      Also read ignore files with this name in every directory\n"
+        << "                                (same syntax as .gitignore, e.g. .ignore); repeatable\n"
+        << "      --skip-hidden             Skip files and directories whose name starts with '.'\n\n"
         << "Output:\n"
         << "      --details                 Show size and modification time\n"
         << "      --color <auto|always|never>  Colour the output (default: auto = only on a terminal;\n"
@@ -336,6 +393,7 @@ void CLIParser::printHelp(const char* programName) {
         << "  -c, --count                   Print only the number of matches\n"
         << "  -q, --quiet                   No summary or warnings\n"
         << "      --verbose                 Print the effective search settings\n"
+        << "      --completion <shell>      Print a completion script (bash, zsh or powershell)\n"
         << "  -h, --help                    Show this help\n"
         << "  -v, --version                 Show version\n\n"
         << "Wildcards:\n"

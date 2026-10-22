@@ -1,4 +1,6 @@
 #include "CLIParser.hpp"
+#include "Completion.hpp"
+#include "Replace.hpp"
 #include "Format.hpp"
 #include "SearchEngine.hpp"
 #include "Utf8.hpp"
@@ -10,7 +12,9 @@
 #include <filesystem>
 #include <iostream>
 #include <optional>
+#include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -58,6 +62,9 @@ struct Palette {
     const char* lineNumber = "";
     const char* separator = "";
     const char* dim = "";
+    const char* match = "";
+    const char* removed = "";
+    const char* added = "";
     const char* reset = "";
 };
 
@@ -88,9 +95,36 @@ Palette makePalette(bool enabled) {
         palette.lineNumber = "\x1b[32m";  // green
         palette.separator = "\x1b[36m";   // cyan
         palette.dim = "\x1b[2m";
+        palette.match = "\x1b[1;31m";   // bold red
+        palette.removed = "\x1b[31m";
+        palette.added = "\x1b[32m";
         palette.reset = "\x1b[0m";
     }
     return palette;
+}
+
+// Text with the given byte ranges wrapped in the match colour.
+std::string highlight(const std::string& text,
+                      const std::vector<std::pair<std::uint32_t, std::uint32_t>>& ranges,
+                      const Palette& colors) {
+    if (ranges.empty() || *colors.match == '\0') {
+        return text;
+    }
+
+    std::string out;
+    std::size_t position = 0;
+    for (const auto& [from, to] : ranges) {
+        if (from < position || to > text.size() || from >= to) {
+            continue;   // overlapping or out of range (e.g. cut off by truncation)
+        }
+        out.append(text, position, from - position);
+        out += colors.match;
+        out.append(text, from, to - from);
+        out += colors.reset;
+        position = to;
+    }
+    out.append(text, position, std::string::npos);
+    return out;
 }
 
 std::string describe(const pfind::FileInfo& file, bool details, const Palette& colors) {
@@ -181,6 +215,11 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
+    if (!cli.completionShell.empty()) {
+        std::cout << pfind::completionScript(cli.completionShell);
+        return 0;
+    }
+
     if (!cli.valid) {
         std::cerr << "Error: " << cli.error << '\n';
         std::cerr << "Use --help for usage information.\n";
@@ -207,7 +246,11 @@ int main(int argc, char* argv[]) {
     }
 
     // Unsorted output is streamed immediately; sorted output needs all matches first.
-    const bool collect = output.sort != pfind::SortKey::None;
+    const bool replaceMode = cli.replace.text.has_value();
+    if (replaceMode) {
+        options.filesWithMatches = true;   // we only need to know WHICH files contain a match
+    }
+    const bool collect = output.sort != pfind::SortKey::None || replaceMode;
     std::vector<pfind::FileInfo> collected;
 
     bool printedGroup = false;
@@ -226,6 +269,7 @@ int main(int argc, char* argv[]) {
     }
 #endif
     const Palette colors = makePalette(useColor);
+    options.highlightMatches = useColor && options.contentPattern.has_value();
     auto emit = [&](const pfind::FileInfo& file) {
         if (output.countOnly) {
             return;
@@ -255,7 +299,8 @@ int main(int argc, char* argv[]) {
                           << colors.separator << separator << colors.reset
                           << colors.lineNumber << match.line << colors.reset
                           << colors.separator << separator << colors.reset << ' '
-                          << (match.context ? colors.dim : "") << match.text
+                          << (match.context ? colors.dim : "")
+                          << (match.context ? match.text : highlight(match.text, match.ranges, colors))
                           << (match.context ? colors.reset : "") << '\n';
             }
         } else {
@@ -288,8 +333,49 @@ int main(int argc, char* argv[]) {
 
     if (collect && !output.countOnly) {
         sortResults(collected, output);
+    }
+    if (collect && !output.countOnly && !replaceMode) {
         for (const auto& file : collected) {
             emit(file);
+        }
+    }
+
+    // ---- --replace: preview or apply ----
+    std::size_t replacedTotal = 0;
+    std::size_t filesChanged = 0;
+    bool replaceFailed = false;
+    std::vector<std::string> replaceErrors;
+
+    if (replaceMode && engine.contentMatcher() != nullptr) {
+        const bool apply = cli.replace.apply;
+        for (const auto& file : collected) {
+            const pfind::ReplaceResult result = pfind::replaceInFile(
+                file.path, *engine.contentMatcher(), *cli.replace.text, apply, cli.replace.backup);
+
+            if (!result.error.empty()) {
+                replaceFailed = true;
+                replaceErrors.push_back(result.error + ": " + pfind::utf8::fromPath(file.path));
+                continue;
+            }
+            if (result.changes.empty()) {
+                continue;
+            }
+
+            ++filesChanged;
+            replacedTotal += result.replacements;
+
+            std::cout << colors.path << pfind::utf8::fromPath(file.path) << colors.reset << "  ("
+                      << result.replacements << (result.replacements == 1 ? " replacement" : " replacements")
+                      << (apply ? ", written" : "") << ")\n";
+
+            if (!apply) {
+                for (const auto& change : result.changes) {
+                    std::cout << colors.lineNumber << "  " << change.line << colors.reset << ' '
+                              << colors.removed << "- " << change.before << colors.reset << '\n'
+                              << colors.lineNumber << "  " << change.line << colors.reset << ' '
+                              << colors.added << "+ " << change.after << colors.reset << '\n';
+                }
+            }
         }
     }
 
@@ -301,7 +387,15 @@ int main(int argc, char* argv[]) {
     }
 
     if (!output.quiet) {
-        if (!output.countOnly) {
+        if (replaceMode) {
+            std::cerr << replacedTotal << (replacedTotal == 1 ? " replacement" : " replacements")
+                      << " in " << filesChanged << (filesChanged == 1 ? " file" : " files")
+                      << (cli.replace.apply ? " written" : " (preview only - nothing was written; add --apply)")
+                      << ", " << elapsed.count() << " ms.\n";
+            for (const auto& error : replaceErrors) {
+                std::cerr << "  ! " << error << '\n';
+            }
+        } else if (!output.countOnly) {
             std::cerr << count << " match" << (count == 1 ? "" : "es")
                       << " found in " << elapsed.count() << " ms.\n";
         }
@@ -320,8 +414,11 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    if (engine.rootFailed()) {
+    if (engine.rootFailed() || replaceFailed) {
         return 2;
+    }
+    if (replaceMode) {
+        return replacedTotal > 0 ? 0 : 1;
     }
     return count > 0 ? 0 : 1;
 }

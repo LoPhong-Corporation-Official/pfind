@@ -2,6 +2,7 @@
 #define PFIND_SEARCH_ENGINE_HPP
 
 #include "FileInfo.hpp"
+#include "IgnoreRules.hpp"
 #include "SearchOptions.hpp"
 #include "Wildcard.hpp"
 
@@ -23,6 +24,9 @@ public:
     // Returns the number of matches. Problems (permissions, broken links,
     // symlink loops, ...) are collected in errors() and never abort the walk.
     std::size_t search(const SearchCallback& callback) const;
+
+    // The compiled --grep matcher, or nullptr when no content search was requested.
+    const Matcher* contentMatcher() const noexcept { return contentMatcher_ ? &*contentMatcher_ : nullptr; }
 
     // True if the root itself could not be searched.
     bool rootFailed() const noexcept { return rootFailed_; }

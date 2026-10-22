@@ -218,6 +218,36 @@ void normalizeInto(std::string_view text, bool foldCaseToo, bool removeAccents, 
     }
 }
 
+void normalizeWithMap(std::string_view text, bool foldCaseToo, bool removeAccents, MappedText& out) {
+    out.text.clear();
+    out.begin.clear();
+    out.end.clear();
+
+    for (std::size_t i = 0; i < text.size();) {
+        char32_t cp = 0;
+        const std::size_t length = decodeOne(text, i, cp);
+        const auto from = static_cast<std::uint32_t>(i);
+        i += length;
+        const auto to = static_cast<std::uint32_t>(i);
+
+        if (removeAccents) {
+            if (isCombiningMark(cp)) {
+                if (!out.end.empty()) {
+                    out.end.back() = to;
+                }
+                continue;
+            }
+            cp = stripAccent(cp);
+        }
+        if (foldCaseToo) {
+            cp = foldCase(cp);
+        }
+        out.text.push_back(cp);
+        out.begin.push_back(from);
+        out.end.push_back(to);
+    }
+}
+
 std::u32string normalize(std::string_view text, bool foldCaseToo, bool removeAccents) {
     std::u32string out;
     normalizeInto(text, foldCaseToo, removeAccents, out);

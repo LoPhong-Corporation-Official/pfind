@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(pfind VERSION 1.4.0 LANGUAGES CXX)
+project(pfind VERSION 1.6.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -16,7 +16,10 @@ endif()
 # Everything except main() lives in a library so tests can link against it.
 add_library(pfind_core STATIC
     src/CLIParser.cpp
+    src/Completion.cpp
     src/Format.cpp
+    src/Replace.cpp
+    src/IgnoreRules.cpp
     src/SearchEngine.cpp
     src/Utf8.cpp
     src/Wildcard.cpp

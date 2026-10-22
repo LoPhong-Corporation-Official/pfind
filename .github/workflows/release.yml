@@ -1,0 +1,108 @@
+name: Release
+
+# Pushing a tag such as v1.5.0 builds pfind for every platform, runs the tests and publishes a
+# GitHub release with one archive per platform plus SHA256SUMS.
+# "Run workflow" (manual) does the same build without publishing - handy as a dry run.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04          # old enough glibc for most Linux distributions
+            target: linux-x86_64
+            archive: tar.gz
+            binary: build/pfind
+            cmake_args: '"-DCMAKE_EXE_LINKER_FLAGS=-static-libstdc++ -static-libgcc"'
+          - os: macos-latest          # one universal binary (Apple Silicon + Intel)
+            target: macos-universal
+            archive: tar.gz
+            binary: build/pfind
+            cmake_args: '"-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64"'
+          - os: windows-latest
+            target: windows-x86_64
+            archive: zip
+            binary: build/Release/pfind.exe
+            cmake_args: '-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded'
+          # To add Linux on ARM (needs a runner that is available to your repository):
+          # - os: ubuntu-22.04-arm
+          #   target: linux-arm64
+          #   archive: tar.gz
+          #   binary: build/pfind
+          #   cmake_args: '"-DCMAKE_EXE_LINKER_FLAGS=-static-libstdc++ -static-libgcc"'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag must match the version in CMakeLists.txt
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: tools/check-version.sh "$GITHUB_REF_NAME"
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DPFIND_WARNINGS_AS_ERRORS=ON ${{ matrix.cmake_args }}
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Binary reports the right version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: tools/check-version.sh "$GITHUB_REF_NAME" "${{ matrix.binary }}"
+
+      - name: Package
+        run: tools/package.sh "${{ matrix.binary }}" "${{ matrix.target }}" "${{ matrix.archive }}" "$GITHUB_REF_NAME"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pfind-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Combine checksums
+        run: |
+          cd dist
+          cat ./*.sha256 > SHA256SUMS
+          rm ./*.sha256
+          ls -l
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prerelease=""
+          case "$GITHUB_REF_NAME" in *-*) prerelease="--prerelease" ;; esac
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "pfind $GITHUB_REF_NAME" \
+            --generate-notes \
+            $prerelease

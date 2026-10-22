@@ -28,6 +28,10 @@ struct SearchOptions {
     bool ignoreAccents{false};
     bool matchFullPath{false};   // match against the path relative to root instead of the name
     bool followSymlinks{false};
+    bool useGitignore{false};            // honour .gitignore files (also parents inside a git repo)
+    std::vector<std::string> ignoreFiles; // extra ignore-file names read in every directory
+    bool skipHidden{false};              // skip names starting with '.'
+    bool highlightMatches{false};        // record the matching ranges inside content-match lines
     bool showDetails{false};
     bool collectMetadata{false}; // fill size/time even without filters (sorting, JSON output)
 

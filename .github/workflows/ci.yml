@@ -19,3 +19,11 @@ jobs:
         run: cmake --build build --config Release
       - name: Test
         run: ctest --test-dir build -C Release --output-on-failure
+      - name: Completion scripts are valid (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y zsh
+          ./build/pfind --completion bash | bash -n
+          ./build/pfind --completion zsh | zsh -n
+          ./build/pfind --completion powershell > pfind.ps1
+          pwsh -NoProfile -File tools/check-ps-syntax.ps1 pfind.ps1

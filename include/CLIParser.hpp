@@ -3,6 +3,7 @@
 
 #include "SearchOptions.hpp"
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -26,6 +27,12 @@ struct OutputOptions {
     ColorMode color{ColorMode::Auto};
 };
 
+struct ReplaceOptions {
+    std::optional<std::string> text;   // --replace
+    bool apply{false};                 // --apply (otherwise: preview only)
+    bool backup{false};                // --backup
+};
+
 struct CLIResult {
     bool showHelp{false};
     bool showVersion{false};
@@ -33,6 +40,8 @@ struct CLIResult {
     std::string error;
     SearchOptions options;
     OutputOptions output;
+    ReplaceOptions replace;
+    std::string completionShell;   // --completion <shell>
 };
 
 class CLIParser {
