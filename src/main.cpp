@@ -68,6 +68,24 @@ struct Palette {
     const char* reset = "";
 };
 
+// Reads an environment variable; empty if it is not set (std::getenv is flagged as unsafe by MSVC).
+std::string environmentVariable(const char* name) {
+#ifdef _WIN32
+    // Win32 API: no MSVC deprecation warning and available in MSVC and MinGW alike.
+    const DWORD size = GetEnvironmentVariableA(name, nullptr, 0);   // includes the terminating NUL
+    if (size == 0) {
+        return {};
+    }
+    std::string result(size, '\0');
+    const DWORD written = GetEnvironmentVariableA(name, result.data(), size);
+    result.resize(written);
+    return result;
+#else
+    const char* value = std::getenv(name);
+    return value != nullptr ? std::string(value) : std::string();
+#endif
+}
+
 bool shouldUseColor(pfind::ColorMode mode) {
     if (mode == pfind::ColorMode::Never) {
         return false;
@@ -76,12 +94,10 @@ bool shouldUseColor(pfind::ColorMode mode) {
         return true;
     }
 
-    const char* noColor = std::getenv("NO_COLOR");
-    if (noColor != nullptr && noColor[0] != '\0') {
+    if (!environmentVariable("NO_COLOR").empty()) {
         return false;
     }
-    const char* term = std::getenv("TERM");
-    if (term != nullptr && std::string(term) == "dumb") {
+    if (environmentVariable("TERM") == "dumb") {
         return false;
     }
     return PFIND_ISATTY(PFIND_FILENO(stdout)) != 0;
